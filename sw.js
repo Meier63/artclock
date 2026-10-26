@@ -2,7 +2,7 @@
 // Vorgehen: immer zuerst die aktuelle Fassung aus dem Netz holen und merken;
 // ohne Netz (oder nach 4 Sekunden ohne Antwort) die gemerkte Fassung verwenden.
 
-const CACHE = 'artclock-v1';
+const CACHE = 'artclock-v2';
 const DATEIEN = ['./', 'index.html', 'artclock.html', 'manifest.json', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

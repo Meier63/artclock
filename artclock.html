@@ -2098,15 +2098,15 @@ function kameraLage(zuBild, verh) {
   const vorne = -(r3[0] * t[0] + r3[1] * t[1] + r3[2] * t[2]) > 0 ? 1 : -1;   // Seite der Scheibe, auf der die Kamera steht
   return { f, r1, r2, r3, t, vorne, verh };
 }
-// Bildrichtung (Anteile 0–1) vom Einstichpunkt (mm) zum Ende eines 100 mm langen, senkrecht abstehenden Darts
-function dartRichtung(x, y) {
+// Bildrichtung (Anteile 0–1) vom Einstichpunkt (mm) zum Ende eines (laenge mm) langen, senkrecht abstehenden Stücks
+function dartRichtung(x, y, laenge = 100) {
   const L = geo && geo.lage;
   if (!L) return null;
   const bild = z => {
     const X = [0, 1, 2].map(i => x * L.r1[i] + y * L.r2[i] + z * L.vorne * L.r3[i] + L.t[i]);
     return [0.5 + L.f * X[0] / X[2], (0.5 / L.verh + L.f * X[1] / X[2]) * L.verh];
   };
-  const p0 = bild(0), p1 = bild(100);
+  const p0 = bild(0), p1 = bild(laenge);
   return [p1[0] - p0[0], p1[1] - p0[1]];
 }
 
@@ -2241,6 +2241,7 @@ const K = {
   stillSeit: 0, bewegt: false, grossMs: 0, letzteZeit: 0, letztePruefung: 0, letzteAnalyse: 0, seitLeer: 0,
   status: '', letzte: null, testPunkte: [], diffBild: null, schleife: false,
   dartBereiche: [], protokoll: [],   // erkannte Darts des Durchgangs (Bildpunkte im Ausschnitt) und die letzten Ereignisse
+  kandidaten: [],                    // Zweifelsfälle der Aufnahme (vermutlich bewegter Flight) – zählen nur, wenn beim Ziehen ein Dart fehlt
   eich: -1, eichNeu: [], justieren: false, gewaehlt: 0, ziehen: null
 };
 
@@ -2396,11 +2397,23 @@ function dartTeile(liste, minF) {
 
 // Sieht ein Bildpunkt aus wie Schatten? Die Scheibe ist dort nur dunkler geworden, die Farbe gleich geblieben
 // (Creme → dunkles Creme, Rot → dunkles Rot). Die Stahlspitze oder ein Barrel haben dagegen eine eigene Farbe.
+// Ein Schatten dunkelt nur teilweise ab (Raumlicht bleibt), nicht auf weniger als die Hälfte. Die Farbgrenze ist eng,
+// sonst gilt auf fast farblosem Creme jedes graue Barrel als „Schatten“ – dann blieb nur der Flight übrig, und dessen
+// Ende wurde als Spitze genommen (Flight zählte als Feld).
 function schattenArtig(i, F, R) {
   const ry = R.y[i];
   if (ry < 35) return false;   // auf Schwarz sieht man keinen Schatten
   const q = F.y[i] / ry;
-  return q > 0.3 && q < 0.92 && Math.abs(F.c[i] - q * R.c[i]) < 8 + 0.08 * Math.abs(R.c[i]);
+  return q > 0.5 && q < 0.92 && Math.abs(F.c[i] - q * R.c[i]) < 4 + 0.1 * Math.abs(R.c[i]);
+}
+
+// Wird ein Bildpunkt nur heller und behält seine Farbe, ist ein Schatten gewichen (Person, Hand, Licht) – kein Dart.
+// (Ein weißer Flight auf Creme, ein Barrel auf Rot oder Grün ändern dagegen die Farbe; auf Schwarz wird nicht geprüft.)
+function aufgehellt(i, F, R) {
+  const ry = R.y[i];
+  if (ry < 25) return false;
+  const q = F.y[i] / ry;
+  return q > 1.06 && q < 3.5 && Math.abs(F.c[i] - q * R.c[i]) < 8 + 0.08 * Math.abs(R.c[i]);
 }
 
 function richtungVektor() {
@@ -2601,7 +2614,7 @@ function referenzNehmen(F) {
 
 function protokoll(text) {
   const d = new Date();
-  K.protokoll = [`${fmtZeit(d)}:${pad(d.getSeconds())}  ${text}`].concat(K.protokoll).slice(0, 15);
+  K.protokoll = [`${fmtZeit(d)}:${pad(d.getSeconds())}  ${text}`].concat(K.protokoll).slice(0, 40);
   const el = document.getElementById('kameraProtokoll');
   if (el) el.textContent = K.protokoll.join('\n');
 }
@@ -2622,6 +2635,7 @@ function erkennungZuruecksetzen() {
   K.grossMs = 0;
   K.seitLeer = 0;
   K.dartBereiche = [];
+  K.kandidaten = [];
   K.diffBild = null;
 }
 
@@ -2658,13 +2672,15 @@ function analysieren(jetzt) {
   if (jetzt - K.stillSeit < kamEinst.ruhe) { statusSetzen(K.grossMs > 300 ? 'Bewegung im Bild …' : 'Bewegung …'); return; }
   if (!K.ref) { referenzNehmen(); statusAktualisieren(); return; }
   if (!K.bewegt && jetzt - K.letztePruefung < 400) return;
-  const gross = K.grossMs > 500;
+  const gross = K.grossMs > 500, bewegt = K.bewegt;
   K.bewegt = false; K.grossMs = 0; K.letztePruefung = jetzt;
 
-  // schneller Vorab-Vergleich im kleinen Bild
+  // schneller Vorab-Vergleich im kleinen Bild – nur wenn sich nichts bewegt hat. Nach einer Bewegung (Wurf) immer
+  // genau auswerten: Ein Dart dicht neben einem anderen ändert im kleinen Bild kaum etwas und würde sonst nach und nach
+  // ins Vergleichsbild übernommen (und ginge verloren).
   const kl = unterschied(klein, K.refKlein, K.maskeK, schwelle());
   const minK = Math.max(3, minMm2() * (K.pxProMm * K.w / K.W) ** 2 * 0.5);
-  if (!gross && kl.anz < minK) {
+  if (!gross && !bewegt && kl.anz < minK) {
     mischen(K.refKlein, klein, 0.1);   // langsame Lichtänderungen übernehmen
     if (kl.anz < minK / 2 && K.ref) {
       const F = bildLesen(true);
@@ -2678,7 +2694,7 @@ function analysieren(jetzt) {
 }
 
 function auswerten(gross, klein) {
-  const F = bildLesen(true), thr = schwelle(), s2 = K.pxProMm ** 2, refAlt = K.ref;
+  const F = bildLesen(true), thr = schwelle(), s2 = K.pxProMm ** 2;
   const minF = Math.max(8, minMm2() * s2), maxF = 20000 * s2;
   const neueRef = () => { K.ref = F; K.refKlein = klein; };
   const warten = kameraWartetAufZiehen();
@@ -2687,28 +2703,41 @@ function auswerten(gross, klein) {
   // Herausgezogen? Nur wenn die Spitzen der erkannten Darts wieder wie die leere Scheibe aussehen –
   // eine Hand vor der Scheibe, ein Lichtwechsel oder ein nachschwingender Dart zählt nicht.
   const uL = K.refLeer ? unterschied(F, K.refLeer, K.maske, thr) : null;   // Unterschied zur leeren Scheibe
-  // Mitten im Durchgang zusätzlich nur nach deutlicher Bewegung (Hand im Bild) – Nachschwingen allein reicht nicht.
-  if (uL && (warten || (gross && K.dartBereiche.length))) {
+  const u = unterschied(F, K.ref, K.maske, thr);
+  // Mitten im Durchgang zusätzlich nur nach deutlicher Bewegung (Hand im Bild) oder großer Veränderung (die Darts sind
+  // weg, ohne dass die Hand als viel Bewegung galt) – Nachschwingen allein reicht nicht.
+  if (uL && (warten || ((gross || u.anz > maxF) && K.dartBereiche.length))) {
     const weg = K.dartBereiche.length
       ? K.dartBereiche.every(d => anteilIn(d.spitze, uL.m) < 0.3)   // nur die Spitze: Flight und Schaft bewegen sich beim Nachschwingen
       : uL.anz < minF;   // Darts nur von Hand eingegeben: ganze Scheibe mit dem Leerbild vergleichen
     if (weg) {
       protokoll(`Herausziehen erkannt (${K.dartBereiche.length} ${K.dartBereiche.length === 1 ? 'Dart' : 'Darts'} weg)`);
-      referenzNehmen(F); K.refKlein = klein;
+      referenzNehmen(F); K.refKlein = klein; K.gezogenAm = performance.now();
       kameraEreignis('gezogen');
       return;
     }
   }
-  const u = unterschied(F, K.ref, K.maske, thr);
-  diffBildSetzen(u.m);
+  // Kurz nach dem Herausziehen geht der Spieler von der Scheibe weg (Schatten, Licht): nichts zählen, nur das Bild der
+  // leeren Scheibe erneuern – sonst entstehen aus dem Weggehen „Würfe“, die es nicht gab. Auch nötig, weil das
+  // Herausziehen oft erkannt wird, solange die Hand noch im Bild ist: Das Leerbild wird so gleich wieder sauber.
+  if (performance.now() - (K.gezogenAm || -1e9) < 2500 && !K.dartBereiche.length) {
+    protokoll('Kurz nach dem Herausziehen – nichts gezählt, Bild der leeren Scheibe erneuert');
+    referenzNehmen(F); K.refKlein = klein;
+    return;
+  }
+  // Gewichene Schatten (nur heller, gleiche Farbe) herausnehmen, bevor nach Darts gesucht wird
+  const m2 = u.m.slice();
+  let anz2 = 0;
+  for (let i = 0; i < m2.length; i++) if (m2[i]) { if (aufgehellt(i, F, K.ref)) m2[i] = 0; else anz2++; }
+  diffBildSetzen(m2);
   if ((gross || u.anz > 2 * maxF) && warten) {
     // Durchgang voll und viel Bewegung: als Herausziehen werten (es wird dabei nichts aufgefüllt, Zählung bleibt richtig)
     protokoll('Viel Bewegung nach 3 Darts – als Herausziehen gewertet');
-    referenzNehmen(F); K.refKlein = klein;
+    referenzNehmen(F); K.refKlein = klein; K.gezogenAm = performance.now();
     kameraEreignis('gezogen');
     return;
   }
-  if (u.anz > 2 * maxF) {
+  if (anz2 > 2 * maxF) {
     // Licht oder Kamera verändert, Darts stecken noch: nur neues Referenzbild, nichts zählen
     protokoll('Bild stark verändert – nichts gezählt');
     neueRef();
@@ -2717,12 +2746,14 @@ function auswerten(gross, klein) {
   if (warten) { protokoll('Änderung nach 3 Darts – nichts gezählt (erst herausziehen)'); neueRef(); return; }
   // Nach einer Handbewegung (Darts nicht gezogen) trotzdem nach neuen Darts suchen: Ein Dart, der kurz vor der
   // Hand geworfen wurde, ist sonst verloren. Die Hand selbst ist jetzt weg (ausgewertet wird erst bei ruhigem Bild).
-  let b = dartTeile(bereiche(u.m, K.W, K.H), minF);
+  if (anz2 < u.anz * 0.6) protokoll(`Schatten gewichen (${Math.round((u.anz - anz2) / s2)} mm² heller) – nicht als Dart gewertet`);
+  let b = dartTeile(bereiche(m2, K.W, K.H), minF);
   if (!b || b.length < minF) {
     if (gross) { protokoll('Bewegung im Bild (Hand/Person) – nichts gezählt'); neueRef(); return; }
     if (b && b.length > minF / 3) protokoll(`Kleine Veränderung (${Math.round(b.length / s2)} mm²) – kein Dart`);
     mischen(K.ref, F, 0.3); statusAktualisieren(); return;
   }
+  if (gross && b.length < 2 * minF) { protokoll('Bewegung im Bild (Hand/Person), nur kleine Veränderung – nichts gezählt'); neueRef(); return; }
   if (gross) protokoll('Bewegung im Bild (Hand/Person) – prüfe auf neuen Dart');
   // Schatten des Darts auf der Scheibe weglassen – er kann im Bild wie eine Verlängerung der Spitze aussehen
   const ohneSchatten = b.filter(i => !schattenArtig(i, F, K.ref));
@@ -2773,48 +2804,78 @@ function auswerten(gross, klein) {
     neueRef();
     return;
   }
-  // Spitze weit außerhalb der Scheibe: kein Dart (z. B. Schatten, Hand am Rand)
-  if (erg.feld && Math.hypot(erg.bx, erg.by) > 260) {
-    protokoll('Veränderung außerhalb der Scheibe – nicht gezählt');
+  // Spitze außerhalb des Doppelrings: nicht zählen (z. B. Schatten, Hand am Rand). Ein echter Dart daneben wird beim
+  // Herausziehen ohnehin als „Daneben“ ergänzt – lieber so als ein Wurf, den es nicht gab.
+  if (erg.feld && Math.hypot(erg.bx, erg.by) > BRETT.dopAussen + 3) {
+    protokoll(`Spitze außerhalb des Doppelrings (${Math.round(Math.hypot(erg.bx, erg.by))} mm) – nicht gezählt`);
     neueRef();
     return;
   }
+  // Ein Dart ist im Bild eine Linie (Spitze, Barrel, Flight). Wie lang sie mindestens sein muss, folgt aus der Kameralage:
+  // ein 100 mm langes, senkrecht steckendes Stück wäre hier lang = erwartet Bildpunkte.
+  const erwartet = erg.feld ? erwarteteLaenge(erg.bx, erg.by) : null;
+  if (erwartet && sp.laenge < Math.max(8, (gross ? 0.35 : 0.2) * erwartet)) {
+    protokoll(`Veränderung zu kurz für einen Dart (${Math.round(sp.laenge)} von ${Math.round(erwartet)} px) – nicht gezählt`);
+    neueRef();
+    return;
+  }
+  // Derselbe Dart, nur bewegt (Flight dreht nach, Dart sackt ab, Autofokus): Die Veränderung liegt dann fast ganz im
+  // Flight-Bereich eines schon steckenden Darts (hinteres Ende, weit weg von seiner Spitze). Ein neuer Dart – auch dicht
+  // daneben – reicht von seiner Spitze auf der Scheibe bis zu seinem Flight und liegt nur zum kleinen Teil dort.
+  // Ein neuer Dart dicht daneben, dessen Spitze verdeckt ist, sieht aber genauso aus. Darum nicht verwerfen, sondern als
+  // Zweifelsfall merken: Fehlt beim Herausziehen ein Dart der Aufnahme (es sind immer 3), wird er nachträglich gezählt.
+  const alt = K.dartBereiche.find(d => d.flug && d.laenge > 0 && b.length < 1.2 * d.px.length && imFlightBereich(b, d) > 0.6);
+  if (alt) {
+    protokoll(`Veränderung am Flight eines steckenden Darts – nicht gezählt, als Zweifelsfall gemerkt (${erg.feld ? erg.feld.name : '?'})`);
+    if (erg.feld) K.kandidaten.push(erg);
+    neueRef();
+    return;
+  }
+  // Zeigt der Dart hier fast genau auf die Kamera, verdeckt der Flight die Spitze: Ergebnis zum Prüfen markieren
+  const sb = erg.feld ? seitenblick(erg.bx, erg.by) : null;
+  if (sb != null && sb < SEITENBLICK_MIN) { erg.sicher = false; protokoll(`Dart zeigt fast auf die Kamera (Seitenblick ${sb.toFixed(2)}) – bitte prüfen`); }
   neueRef();
   dartMelden(b, sp, erg, einschlag, jetztP, 'Dart erkannt');
-  // Noch ein Dart im selben Bild? (zweiter Wurf, bevor das Bild nach dem ersten ruhig war)
-  if (geo && uL) weitereDarts(u, uL, b, sp, F, refAlt, thr, minF, jetzt, einschlag, jetztP);
+}
+
+// Anteil der Bildpunkte px im Flight-Bereich des steckenden Darts d: entlang seiner Achse 55–140 % seiner Länge von der
+// Spitze entfernt, quer bis zur halben Flightbreite mit Rand (rein geometrisch: ein nachgedrehter Flight kann breiter
+// im Bild stehen als vorher und ragt dann über den gemerkten Umriss hinaus)
+function imFlight(x, y, d, ab = 0.55) {
+  const l = Math.hypot(d.flug[0], d.flug[1]) || 1, fx = d.flug[0] / l, fy = d.flug[1] / l, quer = 30 * K.pxProMm;
+  const dx = x - d.sx, dy = y - d.sy, s = dx * fx + dy * fy, t = -dx * fy + dy * fx;
+  return s > ab * d.laenge && s < 1.4 * d.laenge + quer && Math.abs(t) < quer;
+}
+function imFlightBereich(px, d) {
+  if (!d.flug || !(d.laenge > 0)) return 0;
+  let n = 0;
+  for (const i of px) if (imFlight(i % K.W, (i / K.W) | 0, d)) n++;
+  return px.length ? n / px.length : 0;
+}
+
+// Bildlänge (Bildpunkte im Ausschnitt) eines 100 mm langen, senkrecht steckenden Stücks an der Stelle (mm) der Scheibe
+function erwarteteLaenge(x, y) {
+  const d = dartRichtung(x, y);
+  return d ? Math.hypot(d[0] / K.a.w * K.W, d[1] / K.a.h * K.H) : null;
 }
 
 function dartMelden(px, sp, erg, einschlag, erkannt, text) {
   K.seitLeer++;
   // Bereich um die Spitze (15 mm) merken: Ist er wieder wie die leere Scheibe, ist der Dart gezogen
   const R = Math.max(4, 15 * K.pxProMm), spitze = px.filter(i => Math.hypot(i % K.W - sp.x, ((i / K.W) | 0) - sp.y) < R);
-  K.dartBereiche.push({ px, spitze: spitze.length >= 4 ? spitze : px, zeit: erg.zeit, einschlag, erkannt });
+  // Körper des Darts (4 mm verbreitert) und Lage der Spitze merken – gegen Doppelzählen, wenn er sich später bewegt
+  let koerper = new Uint8Array(K.W * K.H);
+  for (const i of px) koerper[i] = 1;
+  for (let k = 0; k < Math.max(2, Math.round(4 * K.pxProMm)); k++) koerper = verbreitern(koerper, K.W, K.H);
+  // Spitze bis Ende des Darts im Bild (für den Flight-Bereich): größte Entfernung entlang der Flugrichtung
+  const l = Math.hypot(sp.flug[0], sp.flug[1]) || 1;
+  let laenge = 0;
+  for (const i of px) laenge = Math.max(laenge, ((i % K.W) - sp.x) * sp.flug[0] / l + (((i / K.W) | 0) - sp.y) * sp.flug[1] / l);
+  K.dartBereiche.push({ px, spitze: spitze.length >= 4 ? spitze : px, koerper, sx: sp.x, sy: sp.y, flug: sp.flug, laenge,
+    zeit: erg.zeit, einschlag, erkannt });
   K.letzte = erg;
   protokoll(`${text}: ${erg.feld ? erg.feld.name : '(nicht eingerichtet)'}`);
   kameraEreignis('dart', erg);
-}
-
-// Weitere, deutlich getrennte Darts in derselben Änderung suchen. Streng, damit Schatten oder Reste nicht mitzählen:
-// neu (nicht nur freigelegt), kein Schatten, groß, länglich, eigene Spitze mindestens 15 mm von der ersten entfernt.
-function weitereDarts(u, uL, b, sp1, F, R, thr, minF, jetzt, einschlag, erkannt) {
-  let weg = new Uint8Array(K.W * K.H);
-  for (const i of b) weg[i] = 1;
-  for (let k = 0; k < Math.max(3, Math.round(6 * K.pxProMm)); k++) weg = verbreitern(weg, K.W, K.H);
-  const rest = new Uint8Array(K.W * K.H);
-  for (let i = 0; i < rest.length; i++) if (u.m[i] && !weg[i] && uL.m[i] && !schattenArtig(i, F, R)) rest[i] = 1;
-  let gefunden = 0;
-  for (const t of bereiche(rest, K.W, K.H)) {
-    if (t.length < 1.5 * minF || gefunden >= 2 || kameraWartetAufZiehen()) break;
-    const e = erwarteteRichtung(t);
-    if (!e) break;
-    const sp = spitzeVerfolgen(spitzeSchaetzen(t, K.W, e), F, R, thr);
-    if (sp.laenge < 30 * K.pxProMm || Math.hypot(sp.x - sp1.x, sp.y - sp1.y) < 15 * K.pxProMm) continue;
-    const nx = K.a.x + (sp.x + 0.5) / K.W * K.a.w, ny = K.a.y + (sp.y + 0.5) / K.H * K.a.h, [bx, by] = zuScheibe(nx, ny);
-    if (Math.hypot(bx, by) > 260) continue;
-    gefunden++;
-    dartMelden(t, sp, { nx, ny, sicher: sp.sicher, zeit: jetzt, bx, by, feld: feldAusPunkt(bx, by) }, einschlag, erkannt, 'Noch ein Dart im selben Bild');
-  }
 }
 
 // Wohin zeigt ein Dart an dieser Stelle im Bild (Bildpunkte im Ausschnitt)? Aus der geschätzten Kameralage.
@@ -2973,7 +3034,19 @@ function kameraEreignis(art, erg) {
 function aufnahmeBeendet(auffuellen) {
   const L = lauf;
   if (!L || L.fertig) return;
-  const fehlen = (3 - L.darts.length % 3) % 3;
+  let fehlen = (3 - L.darts.length % 3) % 3;
+  // Zweifelsfälle (vermutlich bewegter Flight) zählen nur, wenn ein Dart der Aufnahme fehlt – es sind immer 3
+  const kand = fehlen && L.darts.length % 3 ? K.kandidaten.slice(-fehlen) : [];
+  K.kandidaten = [];
+  for (const k of kand) {
+    if (!lauf || lauf.fertig) break;
+    const ziel = lauf.felder[lauf.idx], t = trifft(k.feld, ziel, lauf.segmente);
+    protokoll(`Zweifelsfall nachträglich gezählt: ${k.feld.name} – bitte prüfen`);
+    dartEingabe(t, { q: 'k', w: k.feld.code, e: k.feld.code, tk: t ? 1 : 0, x: Math.round(k.bx * 10) / 10, y: Math.round(k.by * 10) / 10,
+      nx: k.nx, ny: k.ny, knapp: true });
+    fehlen--;
+  }
+  if (!lauf || lauf.fertig) { render(); return; }
   if (fehlen && auffuellen && L.darts.length) {
     protokoll(`${fehlen} nicht gesehene${fehlen === 1 ? 'r Dart' : ' Darts'} als Daneben gezählt`);
     for (let i = 0; i < fehlen; i++) dartEingabe(0, { q: 'a', w: null, e: '?', tk: 0 });
@@ -2991,6 +3064,7 @@ function aufnahmeBeendet(auffuellen) {
 function scheibeLeer() {
   protokoll('„Darts sind gezogen“ / „Referenzbild neu“ getippt');
   K.ref = null;   // neues Referenzbild, sobald das Bild ruhig ist
+  K.gezogenAm = performance.now();
   K.seitLeer = 0;
   K.testPunkte = [];
   if (kameraImSpiel() && ansicht !== 'kamera') { aufnahmeBeendet(false); return; }   // von Hand: nichts auffüllen
@@ -3365,7 +3439,7 @@ function renderKamera() {
   // Einrichten
   h += `<section class="karte"><h2>2. Scheibe einrichten ${kamEinst.punkte ? '<span class="ok">✓</span>' : ''}</h2>
     ${K.warnung ? `<p class="warnung" style="margin-top:0">⚠ ${esc(K.warnung)}</p>` : ''}
-    ${geo && K.eich < 0 ? guteHtml() : ''}
+    ${geo && K.eich < 0 ? guteHtml() + sichtHtml() : ''}
     ${kameraBildHtml('einrichten')}
     ${K.aktiv ? zoomRegler(true) : ''}`;
   if (K.eich >= 0) {
@@ -3477,12 +3551,44 @@ function renderKamera() {
 
 function protokollHtml() {
   return `<details class="tabelle-auf" id="protokollAuf" ${K.protokollOffen ? 'open' : ''}><summary>Was hat die Kamera erkannt? (Protokoll)</summary>
-    <pre id="kameraProtokoll" class="protokoll">${esc(K.protokoll.join('\n') || 'Noch nichts.')}</pre></details>`;
+    <pre id="kameraProtokoll" class="protokoll">${esc(K.protokoll.join('\n') || 'Noch nichts.')}</pre>
+    <div class="zeile abstand"><button class="btn klein" data-a="protokollKopieren">Protokoll kopieren</button>
+      <span class="grau" style="font-size:15px">z. B. zum Weitergeben, wenn ein Wurf falsch gezählt wurde</span></div></details>`;
 }
 
 document.addEventListener('toggle', e => { if (e.target.id === 'protokollAuf') K.protokollOffen = e.target.open; }, true);
 
 // Wie gut passen die Einrichtpunkte zusammen?
+// Wie schräg sieht die Kamera einen senkrecht steckenden Dart an dieser Stelle (mm)? Bildlänge eines kurzen Stücks
+// direkt an der Scheibe im Verhältnis zur gleichen Länge auf der Scheibe: 1 = von der Seite, 0 = genau von vorn.
+function seitenblick(x, y) {
+  const d = dartRichtung(x, y, 5);
+  if (!d) return null;
+  const a = zuKamerabild(x, y), b = zuKamerabild(x + 5, y), c = zuKamerabild(x, y + 5);
+  const masz = (Math.hypot(b[0] - a[0], (b[1] - a[1]) / (kamEinst.seitenverh || 16 / 9)) + Math.hypot(c[0] - a[0], (c[1] - a[1]) / (kamEinst.seitenverh || 16 / 9))) / 2;
+  return masz ? Math.hypot(d[0], d[1] / (kamEinst.seitenverh || 16 / 9)) / masz : null;
+}
+const SEITENBLICK_MIN = 0.42;   // darunter (Blick weniger als ~25° schräg) verdeckt der Flight leicht die Spitze
+
+// Felder, in denen die Darts fast genau auf die Kamera zeigen (Flight verdeckt die Spitze)
+function verdeckteFelder() {
+  if (!geo || !geo.lage) return [];
+  const liste = [];
+  SEKTOREN.forEach((z, i) => {
+    const w = (90 - i * 18) * Math.PI / 180;
+    const schlecht = [60, 103, 140, 166].filter(r => { const s = seitenblick(r * Math.cos(w), r * Math.sin(w)); return s != null && s < SEITENBLICK_MIN; });
+    if (schlecht.length >= 2) liste.push(z);
+  });
+  return liste;
+}
+function sichtHtml() {
+  const v = verdeckteFelder();
+  if (!v.length) return '';
+  return `<p class="hinweis warnung">⚠ Auf <b>${v.join(', ')}</b> zeigen die Darts fast genau auf die Kamera – der Flight verdeckt dort die Spitze,
+    das erkannte Feld ist unsicher (wird zum Prüfen markiert). Besser: Kamera näher an die Wand oder weiter zur Seite setzen,
+    so dass sie die Darts von der Seite sieht, dann neu einrichten.</p>`;
+}
+
 function guteHtml() {
   const g = geo.guete, z = v => v.toFixed(1).replace('.', ',');
   if (geo.punkte < 5) return `<p class="hinweis warnung" style="margin-top:0">Eingerichtet mit ${geo.punkte} Punkten – die Genauigkeit lässt sich so nicht prüfen.
@@ -3527,6 +3633,7 @@ function renderErgebnis() {
     <div class="zeile">
       <button class="btn" data-a="korrigieren">Falsch? → ${d.t ? 'Daneben' : 'Treffer'}</button>
       <button class="btn ${korrModus ? 'an' : ''}" data-a="korrModus">${korrModus ? 'Feld antippen …' : 'Anderes Feld'}</button>
+      ${d.q !== 'h' ? '<button class="btn gefahr" data-a="keinWurf">Kein Wurf</button>' : ''}
     </div>
   </div>`;
 }
@@ -3648,6 +3755,20 @@ const aktionen = {
   dateiLaden: () => dateiLaden(),
   korrigieren: () => korrigieren(),
   korrModus: () => { korrModus = !korrModus; render(); },
+  keinWurf: () => {
+    const d = letzterDart();
+    if (!d) return;
+    protokoll(`„Kein Wurf“ getippt – ${codeName(d.e)} entfernt`);
+    rueckgaengig();
+    meldung('Entfernt. Danke – das hilft auch beim Verbessern der Erkennung (Protokoll unter „Kamera“).');
+  },
+  protokollKopieren: async () => {
+    const text = `ArtClock Kamera-Protokoll ${fmtDatum(new Date())}\n${K.protokoll.join('\n')}\n` +
+      `Einstellungen: Empfindlichkeit ${kamEinst.empf}, Ruhezeit ${kamEinst.ruhe} ms, Zoom ${kamEinst.zoom}, Flights ${kamEinst.richtung}, ` +
+      `Bild ${K.video ? K.video.videoWidth + '×' + K.video.videoHeight : '–'}, ${K.pxProMm.toFixed(2)} px/mm, verdeckt: ${verdeckteFelder().join(',') || 'keine'}`;
+    try { await navigator.clipboard.writeText(text); meldung('Protokoll kopiert – z. B. in eine Nachricht einfügen.'); }
+    catch (e) { dialog(text, [{ text: 'OK', wert: true }]); }
+  },
   tonZiehenProbe: () => { tonFreischalten(); const a = kamEinst.tonZiehen; kamEinst.tonZiehen = true; tonGezogen(); kamEinst.tonZiehen = a; },
   tonProbe: el => { tonFreischalten(); tonSpielen(el.dataset.w === '1'); setTimeout(tonStatusZeigen, 300); },
   zoomPlus: () => zoomAendern(kamEinst.zoom + 0.25),

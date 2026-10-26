@@ -1,0 +1,15 @@
+{
+  "name": "ArtClock – Clock-Training",
+  "short_name": "ArtClock",
+  "description": "Clock-Training für Darter: Segmente und Felder wählen, Treffer per Kamera oder von Hand, Statistik je Spieler.",
+  "lang": "de",
+  "start_url": "artclock.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1412",
+  "theme_color": "#0f1412",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
